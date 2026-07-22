@@ -139,53 +139,50 @@ def infer_type(name: str, context: str = "") -> str:
 
     lower_context = context.lower()
     lower_name = name.lower()
-
-    if any(s.lower() in lower_name.split()[-1:] for s in ORG_SUFFIXES):
-        return "Organization"
-
-    org_pattern = r"\b(?:company|organization|startup|firm|laboratory|lab|university|institute)\s+(?:called|named)?\s*" + re.escape(name.lower())
-    if re.search(org_pattern, lower_context):
-        return "Organization"
-
-    if any(h in lower_context for h in FRAMEWORK_HINTS):
-        # Prefer framework when the name is close to a framework hint.
-        for hint in FRAMEWORK_HINTS:
-            if re.search(re.escape(name.lower()) + r".{0,35}\b" + re.escape(hint) + r"\b", lower_context):
-                return "Framework"
-            if re.search(r"\b" + re.escape(hint) + r"\b.{0,35}" + re.escape(name.lower()), lower_context):
-                return "Framework"
-
-    if any(h in lower_context for h in PRODUCT_HINTS):
-        for hint in PRODUCT_HINTS:
-            if re.search(re.escape(name.lower()) + r".{0,35}\b" + re.escape(hint) + r"\b", lower_context):
-                return "Product"
-            if re.search(r"\b" + re.escape(hint) + r"\b.{0,35}" + re.escape(name.lower()), lower_context):
-                return "Product"
-
-    # Two or three normal capitalized words are usually people.
     words = name.split()
-    if 2 <= len(words) <= 4 and all(re.match(r"^[A-Z][A-Za-z'.-]*$", w) for w in words):
+
+    if words and words[-1].rstrip('.').lower() in {x.rstrip('.').lower() for x in ORG_SUFFIXES}:
+        return "Organization"
+
+    # A conventional two-to-four-word personal name is usually a person.
+    if 2 <= len(words) <= 4 and all(re.match(r"^[A-Z][A-Za-z'-]*$", w) for w in words):
         return "Person"
 
-    # CamelCase / technical names are usually frameworks or products.
+    for hint in FRAMEWORK_HINTS:
+        if re.search(r"\b" + re.escape(hint) + r"\b.{0,30}" + re.escape(lower_name), lower_context):
+            return "Framework"
+        if re.search(re.escape(lower_name) + r".{0,30}\b" + re.escape(hint) + r"\b", lower_context):
+            return "Framework"
+
+    for hint in PRODUCT_HINTS:
+        if re.search(r"\b" + re.escape(hint) + r"\b.{0,30}" + re.escape(lower_name), lower_context):
+            return "Product"
+        if re.search(re.escape(lower_name) + r".{0,30}\b" + re.escape(hint) + r"\b", lower_context):
+            return "Product"
+
     if re.search(r"[a-z][A-Z]", name) or re.search(r"\d", name):
         return "Framework"
 
     return "Organization"
 
-
 def candidate_names(text: str) -> List[str]:
-    # Named phrases beginning with capitals, including acronyms and hyphenated products.
+    """Extract capitalized names without joining entities across punctuation."""
     pattern = re.compile(
-        r"\b(?:[A-Z][A-Za-z0-9_.+-]*|[A-Z]{2,})(?:\s+(?:[A-Z][A-Za-z0-9_.+-]*|[A-Z]{2,})){0,4}\b"
+        r"(?<![A-Za-z0-9_])"
+        r"(?:[A-Z][A-Za-z0-9_+-]*|[A-Z]{2,})"
+        r"(?:[ \t]+(?:[A-Z][A-Za-z0-9_+-]*|[A-Z]{2,})){0,4}"
     )
     stop = {
         "The", "A", "An", "This", "That", "It", "He", "She", "They",
-        "Who", "What", "Which", "When", "Where", "How"
+        "Who", "What", "Which", "When", "Where", "How",
+        "Framework", "Product", "Organization", "Company", "Person"
     }
-    result = []
-    for match in pattern.findall(text):
-        name = clean_name(match)
+
+    result: List[str] = []
+    for match in pattern.finditer(text):
+        name = clean_name(match.group(0))
+        # Strip sentence-final dots while preserving names such as GPT-4.
+        name = name.rstrip(".")
         if name and name not in stop and len(name) > 1:
             result.append(name)
     return list(dict.fromkeys(result))
@@ -206,65 +203,141 @@ def add_relationship(
         relationships.append(item)
 
 
+NAME_PATTERN = r"([A-Z][A-Za-z0-9_+-]*(?:[ \t]+[A-Z][A-Za-z0-9_+-]*){0,3})"
+
+
+def _nearest_entity_of_type(
+    entities_seen: List[Tuple[str, str]], wanted_type: str
+) -> Optional[str]:
+    for name, entity_type in reversed(entities_seen):
+        if entity_type == wanted_type:
+            return name
+    return None
+
+
+def _resolve_generic_subject(
+    sentence: str, entities_seen: List[Tuple[str, str]]
+) -> str:
+    """Resolve phrases such as 'The framework' to the latest matching entity."""
+    replacements = {
+        "framework": "Framework",
+        "library": "Framework",
+        "toolkit": "Framework",
+        "platform": "Framework",
+        "product": "Product",
+        "model": "Product",
+        "assistant": "Product",
+        "company": "Organization",
+        "organization": "Organization",
+        "startup": "Organization",
+        "firm": "Organization",
+    }
+
+    resolved = sentence
+    for generic, entity_type in replacements.items():
+        referent = _nearest_entity_of_type(entities_seen, entity_type)
+        if not referent:
+            continue
+        resolved = re.sub(
+            rf"\b(?:the|this|that|its)\s+{generic}\b",
+            referent,
+            resolved,
+            flags=re.I,
+        )
+    return resolved
+
+
 def extract_relationships(text: str) -> List[Dict[str, str]]:
     relationships: List[Dict[str, str]] = []
+    entities_seen: List[Tuple[str, str]] = []
 
-    # Keep entity matching case-sensitive; only verb phrases are case-insensitive.
-    name = r"([A-Z][A-Za-z0-9_.+-]*(?:\s+[A-Z][A-Za-z0-9_.+-]*){0,4})"
-    sentences = re.split(r"(?<=[.!?])\s+", text)
+    sentences = [x.strip() for x in re.split(r"(?<=[.!?])\s+|\n+", text) if x.strip()]
 
-    specs: List[Tuple[str, str, bool]] = [
-        (name + r"\s+(?i:founded|established|started|co-founded)\s+" + name, "FOUNDED", False),
-        (name + r"\s+(?i:was\s+founded\s+by)\s+" + name, "FOUNDED", True),
-        (name + r"\s+(?i:developed|built|engineered)\s+" + name, "DEVELOPED", False),
-        (name + r"\s+(?i:was\s+(?:developed|built|engineered)\s+by)\s+" + name, "DEVELOPED", True),
-        (name + r"\s+(?i:created|made|designed)\s+" + name, "CREATED", False),
-        (name + r"\s+(?i:was\s+(?:created|made|designed)\s+by)\s+" + name, "CREATED", True),
-        (name + r"\s+(?i:integrates|integrated|works)\s+(?i:with|into)\s+" + name, "INTEGRATED_INTO", False),
-        (name + r"\s+(?i:was\s+integrated\s+into)\s+" + name, "INTEGRATED_INTO", False),
-        (name + r"\s+(?i:hired|recruited|employed)\s+" + name, "HIRED", False),
-        (name + r"\s+(?i:was\s+(?:hired|recruited|employed)\s+by)\s+" + name, "HIRED", True),
-        (name + r"\s+(?i:authored|wrote|co-authored)\s+" + name, "AUTHORED", False),
-        (name + r"\s+(?i:was\s+(?:authored|written)\s+by)\s+" + name, "AUTHORED", True),
-    ]
+    for raw_sentence in sentences:
+        explicit_names = candidate_names(raw_sentence)
+        for name in explicit_names:
+            item = (name, infer_type(name, raw_sentence))
+            if item not in entities_seen:
+                entities_seen.append(item)
 
-    for sentence in sentences:
-        sentence = sentence.strip()
-        for pattern_text, relation, reverse in specs:
-            pattern = re.compile(pattern_text)
-            for match in pattern.finditer(sentence):
-                left, right = clean_name(match.group(1)), clean_name(match.group(2))
-                if reverse:
-                    add_relationship(relationships, right, left, relation)
-                else:
-                    add_relationship(relationships, left, right, relation)
+        sentence = _resolve_generic_subject(raw_sentence, entities_seen)
 
-        passive_specs = [
-            (name + r".{0,55}?\b(?i:created\s+by)\s+" + name, "CREATED"),
-            (name + r".{0,55}?\b(?i:developed\s+by)\s+" + name, "DEVELOPED"),
-            (name + r".{0,55}?\b(?i:founded\s+by)\s+" + name, "FOUNDED"),
-            (name + r".{0,55}?\b(?i:authored\s+by)\s+" + name, "AUTHORED"),
+        specs = [
+            (r"founded|established|started|co-founded", "FOUNDED"),
+            (r"developed|built|engineered", "DEVELOPED"),
+            (r"created|made|designed", "CREATED"),
+            (r"hired|recruited|employed", "HIRED"),
+            (r"authored|wrote|co-authored", "AUTHORED"),
         ]
-        for pattern_text, relation in passive_specs:
-            for match in re.compile(pattern_text).finditer(sentence):
-                target, source = clean_name(match.group(1)), clean_name(match.group(2))
-                add_relationship(relationships, source, target, relation)
+
+        for verbs, relation in specs:
+            passive = re.compile(
+                NAME_PATTERN
+                + rf"(?:\s*,[^,]{{0,60}},\s*|\s+)"
+                + rf"(?i:was|is|has\s+been)\s+(?i:{verbs})\s+(?i:by)\s+"
+                + NAME_PATTERN
+            )
+            for m in passive.finditer(sentence):
+                add_relationship(relationships, m.group(2), m.group(1), relation)
+
+            active = re.compile(
+                NAME_PATTERN + rf"\s+(?i:{verbs})\s+" + NAME_PATTERN
+            )
+            for m in active.finditer(sentence):
+                add_relationship(relationships, m.group(1), m.group(2), relation)
+
+        integration = re.compile(
+            NAME_PATTERN
+            + r"\s+(?i:integrates?|integrated|works?|connects?|interfaces?)"
+            + r"\s+(?i:directly\s+)?(?i:with|into|to)\s+"
+            + NAME_PATTERN
+        )
+        for m in integration.finditer(sentence):
+            add_relationship(relationships, m.group(1), m.group(2), "INTEGRATED_INTO")
+
+        integrated_passive = re.compile(
+            NAME_PATTERN + r"\s+(?i:is|was)\s+(?i:integrated)\s+(?i:with|into)\s+" + NAME_PATTERN
+        )
+        for m in integrated_passive.finditer(sentence):
+            add_relationship(relationships, m.group(1), m.group(2), "INTEGRATED_INTO")
 
     return relationships
 
-
-def extract_entities_and_relationships(text: str) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+def extract_entities_and_relationships(
+    text: str,
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
     relationships = extract_relationships(text)
     names = candidate_names(text)
 
     for rel in relationships:
         names.extend([rel["source"], rel["target"]])
 
-    names = list(dict.fromkeys(clean_name(n) for n in names if clean_name(n)))
+    # Remove accidental generic or verb-containing captures.
+    blocked_words = {
+        "was", "is", "were", "are", "created", "developed", "founded",
+        "integrates", "integrated", "hired", "authored", "wrote"
+    }
+    cleaned_names: List[str] = []
+    for raw_name in names:
+        name = clean_name(raw_name).rstrip(".")
+        lower_tokens = set(tokenise(name))
+        if not name or lower_tokens & blocked_words:
+            continue
+        if name not in cleaned_names:
+            cleaned_names.append(name)
 
-    entities = [{"name": n, "type": infer_type(n, text)} for n in names]
-    entities.sort(key=lambda e: e["name"])
-    relationships.sort(key=lambda r: (r["source"], r["target"], r["relation"]))
+    entities = [
+        {"name": name, "type": infer_type(name, text)}
+        for name in cleaned_names
+    ]
+    entities.sort(key=lambda entity: entity["name"])
+    relationships.sort(
+        key=lambda relation: (
+            relation["source"],
+            relation["target"],
+            relation["relation"],
+        )
+    )
     return entities, relationships
 
 
